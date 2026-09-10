@@ -1,0 +1,168 @@
+#!/bin/sh /etc/rc.common
+
+START=91
+STOP=10
+USE_PROCD=1
+
+PROG=/usr/sbin/adaptive-latencyd
+CONFIG=adaptive_latency
+
+validate_rate()
+{
+	local value="$1"
+	local name="$2"
+
+	case "$value" in
+		''|*[!0-9]*)
+			echo "invalid $name: $value" >&2
+			return 1
+			;;
+	esac
+
+	[ "$value" -gt 0 ] || {
+		echo "invalid $name: $value" >&2
+		return 1
+	}
+}
+
+validate_ifname()
+{
+	local value="$1"
+	local name="$2"
+
+	case "$value" in
+		''|*[!A-Za-z0-9_.:@-]*)
+			echo "invalid $name: $value" >&2
+			return 1
+			;;
+	esac
+}
+
+setup_tc()
+{
+	local wan_if="$1"
+	local ifb_if="$2"
+	local line_rate_mbit="$3"
+	local protect_rate_mbit="$4"
+
+	/usr/lib/adaptive-latency/init_ifb_tc.sh \
+		"$wan_if" "$ifb_if" "${line_rate_mbit}mbit" "${protect_rate_mbit}mbit"
+}
+
+cleanup_tc()
+{
+	local wan_if="$1"
+	local ifb_if="$2"
+
+	/usr/lib/adaptive-latency/cleanup_tc.sh "$wan_if" "$ifb_if"
+}
+
+start_service()
+{
+	local enabled dry_run wan_if ifb_if line_rate_mbit protect_rate_mbit
+	local recover_step_mbit trigger_delay_ms hold_time_ms poll_interval_ms log_interval_ms
+	local bpf_object
+	local realtime_max_kbps bulk_min_kbps realtime_min_pps realtime_max_pps
+	local realtime_score bulk_score
+
+	config_load "$CONFIG"
+	config_get_bool enabled main enabled 0
+	[ "$enabled" -eq 1 ] || {
+		echo "adaptive_latency is disabled"
+		return 0
+	}
+
+	config_get_bool dry_run main dry_run 1
+	config_get wan_if main wan_if wan
+	config_get ifb_if main ifb_if ifb0
+	config_get line_rate_mbit main line_rate_mbit 300
+	config_get protect_rate_mbit main protect_rate_mbit 80
+	config_get recover_step_mbit main recover_step_mbit 20
+	config_get trigger_delay_ms main trigger_delay_ms 2000
+	config_get hold_time_ms main hold_time_ms 5000
+	config_get poll_interval_ms main poll_interval_ms 500
+	config_get log_interval_ms main log_interval_ms 2000
+	config_get bpf_object main bpf_object /usr/lib/adaptive-latency/flowmon.bpf.o
+	config_get realtime_max_kbps main realtime_max_kbps 300
+	config_get bulk_min_kbps main bulk_min_kbps 2048
+	config_get realtime_min_pps main realtime_min_pps 10
+	config_get realtime_max_pps main realtime_max_pps 120
+	config_get realtime_score main realtime_score 6
+	config_get bulk_score main bulk_score 6
+
+	validate_rate "$line_rate_mbit" line_rate_mbit || return 1
+	validate_rate "$protect_rate_mbit" protect_rate_mbit || return 1
+	validate_rate "$recover_step_mbit" recover_step_mbit || return 1
+	validate_rate "$trigger_delay_ms" trigger_delay_ms || return 1
+	validate_rate "$hold_time_ms" hold_time_ms || return 1
+	validate_rate "$poll_interval_ms" poll_interval_ms || return 1
+	validate_rate "$log_interval_ms" log_interval_ms || return 1
+	validate_rate "$realtime_max_kbps" realtime_max_kbps || return 1
+	validate_rate "$bulk_min_kbps" bulk_min_kbps || return 1
+	validate_rate "$realtime_min_pps" realtime_min_pps || return 1
+	validate_rate "$realtime_max_pps" realtime_max_pps || return 1
+	validate_rate "$realtime_score" realtime_score || return 1
+	validate_rate "$bulk_score" bulk_score || return 1
+	validate_ifname "$wan_if" wan_if || return 1
+	validate_ifname "$ifb_if" ifb_if || return 1
+
+	if [ "$protect_rate_mbit" -gt "$line_rate_mbit" ]; then
+		echo "protect_rate_mbit must be <= line_rate_mbit" >&2
+		return 1
+	fi
+
+	if [ "$realtime_min_pps" -gt "$realtime_max_pps" ]; then
+		echo "realtime_min_pps must be <= realtime_max_pps" >&2
+		return 1
+	fi
+
+	setup_tc "$wan_if" "$ifb_if" "$line_rate_mbit" "$protect_rate_mbit" || return 1
+
+	procd_open_instance
+	procd_set_param command "$PROG" \
+		--wan "$wan_if" \
+		--ifb "$ifb_if" \
+		--bpf "$bpf_object" \
+		--line-rate "$line_rate_mbit" \
+		--protect-rate "$protect_rate_mbit" \
+		--recover-step "$recover_step_mbit" \
+		--trigger-delay "$trigger_delay_ms" \
+		--hold-time "$hold_time_ms" \
+		--poll-interval "$poll_interval_ms" \
+		--log-interval "$log_interval_ms" \
+		--realtime-max-kbps "$realtime_max_kbps" \
+		--bulk-min-kbps "$bulk_min_kbps" \
+		--realtime-min-pps "$realtime_min_pps" \
+		--realtime-max-pps "$realtime_max_pps" \
+		--realtime-score "$realtime_score" \
+		--bulk-score "$bulk_score"
+
+	[ "$dry_run" -eq 0 ] && procd_append_param command --apply
+
+	procd_set_param respawn 3600 5 5
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+stop_service()
+{
+	local wan_if ifb_if
+
+	config_load "$CONFIG"
+	config_get wan_if main wan_if wan
+	config_get ifb_if main ifb_if ifb0
+
+	cleanup_tc "$wan_if" "$ifb_if"
+}
+
+reload_service()
+{
+	stop
+	start
+}
+
+service_triggers()
+{
+	procd_add_reload_trigger "$CONFIG"
+}
